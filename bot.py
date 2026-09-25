@@ -1,65 +1,96 @@
 import os
-import threading
-from flask import Flask
+import asyncio
+import tempfile
 import yt_dlp
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CommandHandler
-
-# --- FAKE WEB SERVER TO FIX RENDER "No open ports" ERROR ---
-app = Flask(__name__)
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run_flask, daemon=True).start()
-# -------------------------------------------------------------
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    print("ERROR: BOT_TOKEN not set in Environment!")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Send me any social media link (TikTok, Instagram, YouTube, Twitter, Facebook) and I will download the video for you! 📥"
-    )
+# --- Download function (runs in background) ---
+def download_video(url):
+    temp_dir = tempfile.mkdtemp()
+    output_template = os.path.join(temp_dir, '%(title).50s.%(ext)s')
 
-async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.startswith("http"):
-        return
-    
-    await update.message.reply_text("Downloading... ⏳ Please wait")
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'outtmpl': output_template,
+        'noplaylist': True,
+        'quiet': True,
+        'merge_output_format': 'mp4',
+        'max_filesize': 1900 * 1024 * 1024, # Telegram max 2GB
+    }
 
     try:
-        ydl_opts = {
-            'format': 'mp4/best',
-            'outtmpl': 'video.%(ext)s',
-            'noplaylist': True,
-            'max_filesize': 100 * 1024 * 1024, # 100MB limit for Telegram
-        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-
-        # Send video back
-        with open(filename, 'rb') as f:
-            await update.message.reply_video(video=f, caption="Here is your video ✅")
-
-        # Clean up
-        if os.path.exists(filename):
-            os.remove(filename)
-
+            # Fix filename if merged to mp4
+            if not os.path.exists(filename):
+                filename = os.path.splitext(filename)[0] + ".mp4"
+            return filename, info.get('title', 'Video')
     except Exception as e:
-        await update.message.reply_text(f"Failed to download ❌\nError: {str(e)[:200]}")
-        print(e)
+        return None, str(e)
 
-if __name__ == '__main__':
-    telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
-    print("Bot started...")
-    telegram_app.run_polling()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Welcome to Naija Downloader!\n\n"
+        "Just send me any link from:\n"
+        "TikTok, Instagram, Facebook, Twitter/X, YouTube, Pinterest\n\n"
+        "I will download it without watermark."
+    )
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+
+    if not url.startswith("http"):
+        await update.message.reply_text("Please send a valid video link.")
+        return
+
+    msg = await update.message.reply_text("⏳ Downloading... please wait")
+
+    loop = asyncio.get_event_loop()
+    filepath, title = await loop.run_in_executor(None, download_video, url)
+
+    if not filepath or not os.path.exists(filepath):
+        await msg.edit_text(f"❌ Failed: {title}\n\nTry another link. Some private IG/TikTok videos need login.")
+        return
+
+    file_size = os.path.getsize(filepath) / (1024 * 1024) # in MB
+    await msg.edit_text(f"✅ Downloaded ({file_size:.1f} MB) - Now uploading to Telegram...")
+
+    try:
+        # Telegram now allows up to 2000MB
+        await update.message.reply_video(
+            video=open(filepath, 'rb'),
+            caption=f"✅ {title}",
+            supports_streaming=True
+        )
+        await msg.delete()
+    except Exception as e:
+        # If too large for video, try as document
+        try:
+            await update.message.reply_document(
+                document=open(filepath, 'rb'),
+                caption=f"✅ {title} (sent as file due to size)"
+            )
+            await msg.delete()
+        except Exception as e2:
+            await msg.edit_text(f"❌ File too large for Telegram: {file_size:.1f}MB\nError: {e2}")
+    finally:
+        # Cleanup
+        try:
+            os.remove(filepath)
+            os.rmdir(os.path.dirname(filepath))
+        except:
+            pass
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    print("Bot is running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
